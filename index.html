@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reconocimiento de dígitos manuscritos</title>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="modelo.js"></script>
+<style>
+  :root { --fondo:#f4f6fb; --tarjeta:#fff; --texto:#1c2430; --azul:#1a56db; --gris:#e5e9f2; }
+  @media (prefers-color-scheme: dark) { :root { --fondo:#12161f; --tarjeta:#1c2230; --texto:#e8ecf4; --azul:#6c9bff; --gris:#2c3446; } }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:16px;
+         background:var(--fondo); color:var(--texto); font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  main { background:var(--tarjeta); border-radius:16px; padding:24px; width:100%; max-width:760px;
+         box-shadow:0 6px 24px rgba(0,0,0,.12); }
+  h1 { margin:0 0 4px; font-size:1.4rem; }
+  p.sub { margin:0 0 18px; opacity:.7; font-size:.95rem; }
+  .fila { display:flex; gap:24px; flex-wrap:wrap; justify-content:center; }
+  .col { display:flex; flex-direction:column; align-items:center; gap:12px; }
+  canvas#lienzo { width:280px; height:280px; max-width:100%; border-radius:12px; background:#000;
+                  touch-action:none; cursor:crosshair; border:3px solid var(--gris); }
+  .botones { display:flex; gap:10px; }
+  button { font:inherit; font-weight:600; padding:10px 22px; border-radius:10px; border:0; cursor:pointer; }
+  #btnPredecir { background:var(--azul); color:#fff; }
+  #btnPredecir:disabled { opacity:.5; cursor:wait; }
+  #btnBorrar { background:var(--gris); color:var(--texto); }
+  #resultado { font-size:5rem; font-weight:700; line-height:1; min-height:5rem; color:var(--azul); }
+  #confianza { opacity:.75; min-height:1.4em; text-align:center; }
+  .barras { width:260px; display:flex; flex-direction:column; gap:3px; }
+  .barra { display:flex; align-items:center; gap:6px; font-size:.8rem; }
+  .barra span.n { width:12px; text-align:right; }
+  .barra .pista { flex:1; height:10px; background:var(--gris); border-radius:5px; overflow:hidden; }
+  .barra .relleno { height:100%; width:0; background:var(--azul); transition:width .25s; }
+  .barra span.p { width:42px; text-align:right; }
+  #vista { width:84px; height:84px; image-rendering:pixelated; border-radius:6px; background:#000; border:2px solid var(--gris); }
+  small { opacity:.65; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Reconocimiento de dígitos manuscritos</h1>
+  <p class="sub">Dibuja un dígito (0-9) en el recuadro negro y presiona <b>Predecir</b>.</p>
+  <div class="fila">
+    <div class="col">
+      <canvas id="lienzo" width="280" height="280"></canvas>
+      <div class="botones">
+        <button id="btnPredecir" disabled>Cargando modelo…</button>
+        <button id="btnBorrar">Borrar</button>
+      </div>
+    </div>
+    <div class="col">
+      <div id="resultado">?</div>
+      <div id="confianza"></div>
+      <div class="barras" id="barras"></div>
+      <div class="col"><canvas id="vista" width="28" height="28"></canvas><small>Lo que ve el modelo (28×28)</small></div>
+    </div>
+  </div>
+</main>
+
+<script>
+const lienzo = document.getElementById("lienzo");
+const ctx = lienzo.getContext("2d", { willReadFrequently: true });
+const btnPredecir = document.getElementById("btnPredecir");
+const resultado = document.getElementById("resultado");
+const confianza = document.getElementById("confianza");
+const vista = document.getElementById("vista");
+
+//---------- Barras de probabilidad ----------
+const barras = document.getElementById("barras");
+for (let i = 0; i < 10; i++) {
+  barras.insertAdjacentHTML("beforeend",
+    `<div class="barra"><span class="n">${i}</span><div class="pista"><div class="relleno" id="r${i}"></div></div><span class="p" id="p${i}">0%</span></div>`);
+}
+function mostrarProbs(probs) {
+  probs.forEach((p, i) => {
+    document.getElementById("r" + i).style.width = (p * 100) + "%";
+    document.getElementById("p" + i).textContent = (p * 100).toFixed(1) + "%";
+  });
+}
+
+//---------- Dibujo (mouse y táctil) ----------
+function limpiar() {
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, 280, 280);
+  resultado.textContent = "?";
+  confianza.textContent = "";
+  mostrarProbs(new Array(10).fill(0));
+  vista.getContext("2d").clearRect(0, 0, 28, 28);
+}
+ctx.lineWidth = 20;
+ctx.lineCap = "round";
+ctx.lineJoin = "round";
+ctx.strokeStyle = "#fff";
+limpiar();
+
+let dibujando = false;
+function posicion(e) {
+  const r = lienzo.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * 280 / r.width, y: (e.clientY - r.top) * 280 / r.height };
+}
+lienzo.addEventListener("pointerdown", e => {
+  dibujando = true;
+  lienzo.setPointerCapture(e.pointerId);
+  const p = posicion(e);
+  ctx.beginPath();
+  ctx.moveTo(p.x, p.y);
+  ctx.lineTo(p.x + 0.01, p.y + 0.01); //Permite dibujar un punto
+  ctx.stroke();
+});
+lienzo.addEventListener("pointermove", e => {
+  if (!dibujando) return;
+  const p = posicion(e);
+  ctx.lineTo(p.x, p.y);
+  ctx.stroke();
+});
+["pointerup", "pointercancel"].forEach(ev => lienzo.addEventListener(ev, () => { dibujando = false; }));
+document.getElementById("btnBorrar").addEventListener("click", limpiar);
+
+//---------- Preprocesamiento (mismo método del notebook: recorte, 20 px, centrado por centro de masa) ----------
+function preprocesar() {
+  const datos = ctx.getImageData(0, 0, 280, 280).data;
+  let x0 = 280, y0 = 280, x1 = -1, y1 = -1;
+  for (let y = 0; y < 280; y++) {
+    for (let x = 0; x < 280; x++) {
+      if (datos[(y * 280 + x) * 4] > 40) {
+        if (x < x0) x0 = x; if (x > x1) x1 = x;
+        if (y < y0) y0 = y; if (y > y1) y1 = y;
+      }
+    }
+  }
+  if (x1 < 0) return null; //Lienzo vacío
+
+  const w = x1 - x0 + 1, h = y1 - y0 + 1;
+  //Centro de masa del recorte
+  let masa = 0, cx = 0, cy = 0;
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const v = datos[(y * 280 + x) * 4];
+      masa += v; cx += v * (x - x0); cy += v * (y - y0);
+    }
+  }
+  cx /= masa; cy /= masa;
+
+  const escala = 20 / Math.max(w, h);
+  const tmp = document.createElement("canvas");
+  tmp.width = 28; tmp.height = 28;
+  const t = tmp.getContext("2d", { willReadFrequently: true });
+  t.fillStyle = "#000";
+  t.fillRect(0, 0, 28, 28);
+  t.imageSmoothingEnabled = true;
+  t.imageSmoothingQuality = "high";
+  //Se dibuja el recorte escalado de modo que su centro de masa quede en (14,14)
+  t.drawImage(lienzo, x0, y0, w, h, 14 - cx * escala, 14 - cy * escala, w * escala, h * escala);
+
+  const px = t.getImageData(0, 0, 28, 28).data;
+  const entrada = new Float32Array(784);
+  for (let i = 0; i < 784; i++) entrada[i] = px[i * 4] / 255; //Normalización 0 a 1
+  vista.getContext("2d").drawImage(tmp, 0, 0);
+  return entrada;
+}
+
+//---------- Modelo: se reconstruye en TensorFlow.js a partir de modelo.js ----------
+let modelo = null;
+function construirModelo() {
+  const m = tf.sequential();
+  let primera = true;
+  for (const c of MODELO) {
+    let capa;
+    const extra = primera ? { inputShape: [28, 28, 1] } : {};
+    if (c.tipo === "conv") capa = tf.layers.conv2d({ filters: c.filtros, kernelSize: 3, padding: "same", activation: c.activacion, ...extra });
+    else if (c.tipo === "bn") capa = tf.layers.batchNormalization({ epsilon: c.epsilon, ...extra });
+    else if (c.tipo === "pool") capa = tf.layers.maxPooling2d({ poolSize: 2, ...extra });
+    else if (c.tipo === "flatten") capa = tf.layers.flatten(extra);
+    else if (c.tipo === "dense") capa = tf.layers.dense({ units: c.unidades, activation: c.activacion, ...extra });
+    m.add(capa);
+    primera = false;
+    if (c.pesos.length) capa.setWeights(c.pesos.map((p, i) => tf.tensor(p, c.formas[i])));
+  }
+  return m;
+}
+
+async function iniciar() {
+  try {
+    modelo = construirModelo();
+    tf.tidy(() => modelo.predict(tf.zeros([1, 28, 28, 1]))); //Calentamiento
+    btnPredecir.textContent = "Predecir";
+    btnPredecir.disabled = false;
+  } catch (err) {
+    console.error(err);
+    btnPredecir.textContent = "Error al cargar el modelo";
+  }
+}
+
+function predecir() {
+  const entrada = preprocesar();
+  if (!entrada) { resultado.textContent = "?"; confianza.textContent = "Primero dibuja un dígito"; return; }
+  const probs = tf.tidy(() => modelo.predict(tf.tensor4d(entrada, [1, 28, 28, 1])).dataSync());
+  const lista = Array.from(probs);
+  const mejor = lista.indexOf(Math.max(...lista));
+  resultado.textContent = mejor;
+  confianza.textContent = "Confianza: " + (lista[mejor] * 100).toFixed(1) + "%";
+  mostrarProbs(lista);
+}
+btnPredecir.addEventListener("click", predecir);
+iniciar();
+</script>
+</body>
+</html>
